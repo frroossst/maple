@@ -285,15 +285,17 @@ impl Document {
     }
 
     #[inline]
-    fn append_unordered_list(&mut self, items: Vec<String>) {
-        let mut list_html = String::from("<ul>");
+    fn append_unordered_list(&mut self, items: Vec<Vec<MdAst>>) {
+        // Emit the list as a sequence of segments so `(show ...)` inside a
+        // bullet becomes a real DocAst::Show that `fmt` renders to MathML,
+        // instead of being flattened away by `inline_to_html`.
+        self.append(DocAst::Html("<ul>".into()));
         for item in items {
-            list_html.push_str(&format!("<li>{}</li>", item));
+            self.append(DocAst::Html("<li>".into()));
+            self.append_inline_nodes(item);
+            self.append(DocAst::Html("</li>".into()));
         }
-        list_html.push_str("</ul>");
-
-        let dast = DocAst::Html(list_html.into());
-        self.append(dast);
+        self.append(DocAst::Html("</ul>".into()));
     }
 
     #[inline]
@@ -309,18 +311,39 @@ impl Document {
     }
 
     #[inline]
-    fn append_blockquote(&mut self, content: String) {
-        let blockquote_html = format!("<blockquote>{}</blockquote>", content);
+    fn append_blockquote(&mut self, content: Vec<MdAst>) {
+        self.append(DocAst::Html("<blockquote>".into()));
+        self.append_inline_nodes(content);
+        self.append(DocAst::Html("</blockquote>".into()));
+    }
 
-        let dast = DocAst::Html(blockquote_html.into());
-        self.append(dast);
+    /// Append inline nodes, turning `(show ...)` into a real DocAst::Show so
+    /// `fmt` renders it to MathML, and everything else into HTML text.
+    fn append_inline_nodes(&mut self, nodes: Vec<MdAst>) {
+        let mut html = String::new();
+        for node in nodes {
+            match node {
+                MdAst::ShowBlock { code } => {
+                    if !html.is_empty() {
+                        self.append(DocAst::Html(std::mem::take(&mut html).into()));
+                    }
+                    let mut p = Parser::new(&code);
+                    let r = p
+                        .parse()
+                        .unwrap_or_else(|e| LispAST::Error(e.to_string()));
+                    self.append(DocAst::Show(r));
+                }
+                other => html.push_str(&inline_to_html(&other)),
+            }
+        }
+        if !html.is_empty() {
+            self.append(DocAst::Html(html.into()));
+        }
     }
 
     #[inline]
     fn append_spoiler(&mut self, content: String) {
-        let begin = "<span style=\"background:#2f3136;color:transparent;border-radius:3px;padding:0 4px;cursor:pointer\" onmouseover=\"this.style.color='#dcddde'\" onmouseout=\"this.style.color='transparent'\">";
-        let end = "</span>";
-        let spoiler_html = format!("{}{}{}", begin, content, end);
+        let spoiler_html = format!("{}{}{}", SPOILER_BEGIN, content, SPOILER_END);
 
         let dast = DocAst::Html(spoiler_html.into());
         self.append(dast);
@@ -375,6 +398,30 @@ impl Document {
     fn append_page_separator(&mut self) {
         let dast = DocAst::Html("<hr/>".into());
         self.append(dast);
+    }
+}
+
+const SPOILER_BEGIN: &str = "<span style=\"background:#2f3136;color:transparent;border-radius:3px;padding:0 4px;cursor:pointer\" onmouseover=\"this.style.color='#dcddde'\" onmouseout=\"this.style.color='transparent'\">";
+const SPOILER_END: &str = "</span>";
+
+/// Render a single inline node to an HTML fragment. Used for contexts that
+/// hold rich inline children but no block structure — currently list items,
+/// whose code spans, links and emphasis must survive rendering.
+fn inline_to_html(node: &MdAst) -> String {
+    match node {
+        MdAst::Text { content } => content.replace('\n', "<br/>"),
+        MdAst::InlineCode { code } => format!("<code>{}</code>", escape_html(code)),
+        MdAst::Bold { text } => format!("<strong>{}</strong>", text),
+        MdAst::Italic { text } => format!("<em>{}</em>", text),
+        MdAst::Underline { text } => format!("<u>{}</u>", text),
+        MdAst::Strikethrough { text } => format!("<s>{}</s>", text),
+        MdAst::Link { text, url } => format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+            url, text
+        ),
+        MdAst::Spoiler { content } => format!("{}{}{}", SPOILER_BEGIN, content, SPOILER_END),
+        // Block-level / interactive nodes don't appear inline in a list item.
+        _ => String::new(),
     }
 }
 

@@ -113,9 +113,11 @@ static SYMBOLS: LazyLock<HashMap<&'static str, SymbolEntry>> = LazyLock::new(|| 
         ("arrowleft",    "←", "Leftward arrow"),
         ("arrowright",   "→", "Rightward arrow"),
         ("arrow",        "→", "Right arrow (shorthand for arrowright)"),
+        ("mapsto",       "↦", "Maps-to arrow — used for substitutions like [α ↦ τ]"),
 
         // Miscellaneous
         ("ellipsis",     "…", "Horizontal ellipsis — continuation dots"),
+        ("circ",         "∘", "Ring operator — function/substitution composition"),
 
         // Special sets and transforms
         ("Laplace",      "𝓛", "Laplace transform operator"),

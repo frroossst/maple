@@ -32,7 +32,7 @@ pub enum MdAst {
         text: String,
     },
     UnorderedList {
-        items: Vec<String>,
+        items: Vec<Vec<MdAst>>,
     },
     CheckboxUnchecked {
         text: String,
@@ -41,7 +41,9 @@ pub enum MdAst {
         text: String,
     },
     BlockQuote {
-        content: String,
+        /// Rich inline content, so links, code spans and `(show ...)` inside
+        /// a quote render instead of being emitted as raw markdown.
+        content: Vec<MdAst>,
     },
     Spoiler {
         content: String,
@@ -106,6 +108,38 @@ enum Token {
     Newline,
     Text(String),
     Whitespace(String),
+}
+
+/// Reconstruct the literal source characters a token was produced from.
+///
+/// Used inside verbatim contexts (inline code, fenced code blocks) where the
+/// markdown markers a token stands for must be emitted as-is instead of being
+/// interpreted — so ``a*b``, `x_i` and `f(x)` keep their punctuation rather
+/// than having it silently swallowed. Block-level markers are only reachable
+/// here after a newline, so their canonical spelling is reproduced.
+fn token_literal(token: &Token) -> String {
+    match token {
+        Token::Text(t) => t.clone(),
+        Token::Whitespace(ws) => ws.clone(),
+        Token::Newline => "\n".to_string(),
+        Token::SingleBacktick => "`".to_string(),
+        Token::TripleBacktick => "```".to_string(),
+        Token::DoublePipe => "||".to_string(),
+        Token::DoubleStar => "**".to_string(),
+        Token::SingleStar => "*".to_string(),
+        Token::Underscore => "_".to_string(),
+        Token::Tilde => "~".to_string(),
+        Token::LeftBracket => "[".to_string(),
+        Token::RightBracket => "]".to_string(),
+        Token::LeftParen => "(".to_string(),
+        Token::RightParen => ")".to_string(),
+        Token::TripleDash => "---".to_string(),
+        Token::Header(level) => format!("{} ", "#".repeat(*level as usize)),
+        Token::BulletPoint => "- ".to_string(),
+        Token::CheckboxUnchecked => "-[ ] ".to_string(),
+        Token::CheckboxChecked => "-[x] ".to_string(),
+        Token::BlockQuote => "> ".to_string(),
+    }
 }
 
 struct Tokenizer<'a> {
@@ -454,6 +488,24 @@ impl TokenParser {
         text
     }
 
+    /// Collect tokens verbatim until (and consuming) the closing delimiter,
+    /// reconstructing each token's literal source text. Used by every span
+    /// whose body is plain text — inline code, spoilers, emphasis and link
+    /// text/URLs — so formatting punctuation (`*`, `_`, `(`, ...) inside them
+    /// is preserved rather than silently dropped.
+    fn collect_until(&mut self, is_close: impl Fn(&Token) -> bool) -> String {
+        let mut out = String::new();
+        while let Some(token) = self.peek(0) {
+            if is_close(token) {
+                self.advance();
+                break;
+            }
+            out.push_str(&token_literal(token));
+            self.advance();
+        }
+        out
+    }
+
     fn parse_inline_elements(&mut self, until_newline: bool) -> Vec<MdAst> {
         let mut elements = Vec::new();
         let mut text_buffer = String::new();
@@ -485,80 +537,19 @@ impl TokenParser {
                 Token::SingleBacktick => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut code = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::SingleBacktick => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                code.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                code.push_str(ws);
-                                self.advance();
-                            }
-                            Token::Newline => {
-                                code.push('\n');
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let code = self.collect_until(|t| matches!(t, Token::SingleBacktick));
                     elements.push(MdAst::InlineCode { code });
                 }
                 Token::DoublePipe => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut content = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::DoublePipe => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                content.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                content.push_str(ws);
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let content = self.collect_until(|t| matches!(t, Token::DoublePipe));
                     elements.push(MdAst::Spoiler { content });
                 }
                 Token::DoubleStar => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut text = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::DoubleStar => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                text.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                text.push_str(ws);
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let text = self.collect_until(|t| matches!(t, Token::DoubleStar));
                     elements.push(MdAst::Bold { text });
                 }
                 Token::SingleStar => {
@@ -574,125 +565,33 @@ impl TokenParser {
                     } else {
                         flush_text(&mut text_buffer, &mut elements);
                         self.advance();
-                        let mut text = String::new();
-                        while let Some(token) = self.peek(0) {
-                            match token {
-                                Token::SingleStar => {
-                                    self.advance();
-                                    break;
-                                }
-                                Token::Text(t) => {
-                                    text.push_str(t);
-                                    self.advance();
-                                }
-                                Token::Whitespace(ws) => {
-                                    text.push_str(ws);
-                                    self.advance();
-                                }
-                                _ => {
-                                    self.advance();
-                                }
-                            }
-                        }
+                        let text = self.collect_until(|t| matches!(t, Token::SingleStar));
                         elements.push(MdAst::Italic { text });
                     }
                 }
                 Token::Underscore => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut text = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::Underscore => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                text.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                text.push_str(ws);
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let text = self.collect_until(|t| matches!(t, Token::Underscore));
                     elements.push(MdAst::Underline { text });
                 }
                 Token::Tilde => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut text = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::Tilde => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                text.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                text.push_str(ws);
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let text = self.collect_until(|t| matches!(t, Token::Tilde));
                     elements.push(MdAst::Strikethrough { text });
                 }
                 Token::LeftBracket => {
                     flush_text(&mut text_buffer, &mut elements);
                     self.advance();
-                    let mut link_text = String::new();
-                    while let Some(token) = self.peek(0) {
-                        match token {
-                            Token::RightBracket => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                link_text.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                link_text.push_str(ws);
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
-                        }
-                    }
+                    let link_text = self.collect_until(|t| matches!(t, Token::RightBracket));
 
                     if matches!(self.peek(0), Some(Token::LeftParen)) {
                         self.advance();
-                        let mut url = String::new();
-                        while let Some(token) = self.peek(0) {
-                            match token {
-                                Token::RightParen => {
-                                    self.advance();
-                                    break;
-                                }
-                                Token::Text(t) => {
-                                    url.push_str(t);
-                                    self.advance();
-                                }
-                                Token::Whitespace(ws) => {
-                                    url.push_str(ws);
-                                    self.advance();
-                                }
-                                _ => {
-                                    self.advance();
-                                }
-                            }
-                        }
+                        // URL is verbatim: `_`, `~`, `*` etc. are all valid URL
+                        // characters and must survive (e.g. a Wikipedia path
+                        // like `Niels_Henrik_Abel`).
+                        let url = self.collect_until(|t| matches!(t, Token::RightParen));
                         elements.push(MdAst::Link {
                             text: link_text,
                             url,
@@ -708,16 +607,23 @@ impl TokenParser {
                     self.advance();
 
                     if let Some(Token::Text(first_word)) = self.peek(0) {
-                        let word_trimmed = first_word.trim();
-                        if word_trimmed == "eval" || word_trimmed == "show" {
-                            let is_eval = word_trimmed == "eval";
+                        // A Text token may carry words after the head, e.g.
+                        // `(show G)` tokenizes as Text("show G"), so split the
+                        // head off and keep the remainder as scheme source.
+                        let trimmed = first_word.trim_start();
+                        let (head, rest) = match trimmed.find(char::is_whitespace) {
+                            Some(i) => (&trimmed[..i], trimmed[i..].trim_start().to_string()),
+                            None => (trimmed.trim_end(), String::new()),
+                        };
+                        if head == "eval" || head == "show" {
+                            let is_eval = head == "eval";
                             self.advance();
 
                             if matches!(self.peek(0), Some(Token::Whitespace(_))) {
                                 self.advance();
                             }
 
-                            let mut scheme_code = String::new();
+                            let mut scheme_code = rest;
                             let mut paren_depth = 1;
 
                             while let Some(token) = self.peek(0) {
@@ -866,16 +772,11 @@ impl TokenParser {
 
                     while matches!(self.peek(0), Some(Token::BulletPoint)) {
                         self.advance();
+                        // Keep the item's rich inline content so code spans,
+                        // links and emphasis inside a bullet render properly
+                        // instead of being flattened away.
                         let inline = self.parse_inline_elements(true);
-                        let text = inline
-                            .into_iter()
-                            .map(|node| match node {
-                                MdAst::Text { content } => content,
-                                MdAst::InlineCode { code } => format!("`{}`", code),
-                                _ => String::new(),
-                            })
-                            .collect::<String>();
-                        items.push(text);
+                        items.push(inline);
 
                         // Skip newlines between bullet points
                         self.skip_newlines();
@@ -895,7 +796,7 @@ impl TokenParser {
                 }
                 Some(Token::BlockQuote) => {
                     self.advance();
-                    let content = self.collect_line_text();
+                    let content = self.parse_inline_elements(true);
                     ast_nodes.push(MdAst::BlockQuote { content });
                 }
                 Some(Token::TripleDash) => {
@@ -918,71 +819,16 @@ impl TokenParser {
                     }
 
                     let mut code = String::new();
-                    let mut iterations = 0;
                     while let Some(token) = self.peek(0) {
-                        iterations += 1;
-                        if iterations % 100 == 0 {}
-                        match token {
-                            Token::TripleBacktick => {
-                                self.advance();
-                                break;
-                            }
-                            Token::Text(t) => {
-                                code.push_str(t);
-                                self.advance();
-                            }
-                            Token::Whitespace(ws) => {
-                                code.push_str(ws);
-                                self.advance();
-                            }
-                            Token::Newline => {
-                                code.push('\n');
-                                self.advance();
-                            }
-                            Token::LeftParen => {
-                                code.push('(');
-                                self.advance();
-                            }
-                            Token::RightParen => {
-                                code.push(')');
-                                self.advance();
-                            }
-                            Token::LeftBracket => {
-                                code.push('[');
-                                self.advance();
-                            }
-                            Token::RightBracket => {
-                                code.push(']');
-                                self.advance();
-                            }
-                            Token::SingleBacktick => {
-                                code.push('`');
-                                self.advance();
-                            }
-                            Token::DoublePipe => {
-                                code.push_str("||");
-                                self.advance();
-                            }
-                            Token::DoubleStar => {
-                                code.push_str("**");
-                                self.advance();
-                            }
-                            Token::SingleStar => {
-                                code.push('*');
-                                self.advance();
-                            }
-                            Token::Underscore => {
-                                code.push('_');
-                                self.advance();
-                            }
-                            Token::Tilde => {
-                                code.push('~');
-                                self.advance();
-                            }
-                            _ => {
-                                self.advance();
-                            }
+                        // A fenced block is verbatim: the closing ``` ends it,
+                        // and every other token — including line-level markers
+                        // like `---` or `#` — is emitted as literal source.
+                        if matches!(token, Token::TripleBacktick) {
+                            self.advance();
+                            break;
                         }
+                        code.push_str(&token_literal(token));
+                        self.advance();
                     }
 
                     ast_nodes.push(MdAst::CodeBlock { language, code });
@@ -1047,6 +893,22 @@ mod tests {
         assert!(matches!(ast[2], MdAst::Header { level: 3, .. }));
     }
 
+    /// Flatten a list item's inline nodes back to plain text for assertions.
+    fn item_text(item: &[MdAst]) -> String {
+        item.iter()
+            .map(|node| match node {
+                MdAst::Text { content } => content.clone(),
+                MdAst::InlineCode { code } => code.clone(),
+                MdAst::Bold { text }
+                | MdAst::Italic { text }
+                | MdAst::Underline { text }
+                | MdAst::Strikethrough { text } => text.clone(),
+                MdAst::Link { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn test_bullet_points() {
         let input = "- Item 1\n- Item 2";
@@ -1054,8 +916,28 @@ mod tests {
         assert_eq!(ast.len(), 1);
         if let MdAst::UnorderedList { items } = &ast[0] {
             assert_eq!(items.len(), 2);
-            assert_eq!(items[0], "Item 1");
-            assert_eq!(items[1], "Item 2");
+            assert_eq!(item_text(&items[0]), "Item 1");
+            assert_eq!(item_text(&items[1]), "Item 2");
+        } else {
+            panic!("Expected UnorderedList");
+        }
+    }
+
+    #[test]
+    fn test_bullet_point_preserves_inline_code() {
+        // Regression: inline code inside a bullet used to be flattened to a
+        // literal `` `code` `` string; now it stays a real InlineCode node.
+        let input = "- `a*b` is the product";
+        let ast = Parser::new(input).parse().unwrap();
+        if let MdAst::UnorderedList { items } = &ast[0] {
+            assert_eq!(items.len(), 1);
+            assert!(
+                items[0]
+                    .iter()
+                    .any(|n| matches!(n, MdAst::InlineCode { code } if code == "a*b")),
+                "expected an InlineCode(a*b) node, got {:?}",
+                items[0]
+            );
         } else {
             panic!("Expected UnorderedList");
         }
@@ -1139,6 +1021,43 @@ mod tests {
                 _ => false,
             }
         }));
+    }
+
+    #[test]
+    fn test_inline_code_preserves_special_chars() {
+        // Regression: formatting markers inside inline code used to be
+        // swallowed, e.g. `a*b` rendered as "ab" and `*` rendered as "".
+        let cases = [
+            ("`*`", "*"),
+            ("`a*b`", "a*b"),
+            ("`a*b = b*a`", "a*b = b*a"),
+            ("`x_i`", "x_i"),
+            ("`f(x)`", "f(x)"),
+            ("`a[0]`", "a[0]"),
+        ];
+
+        for (input, expected) in cases {
+            let ast = Parser::new(input).parse().unwrap();
+
+            fn find_code(nodes: &[MdAst]) -> Option<String> {
+                for node in nodes {
+                    match node {
+                        MdAst::InlineCode { code } => return Some(code.clone()),
+                        MdAst::Paragraph { children } => {
+                            if let Some(c) = find_code(children) {
+                                return Some(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+
+            let code = find_code(&ast)
+                .unwrap_or_else(|| panic!("no inline code parsed for {input:?}"));
+            assert_eq!(code, expected, "input {input:?}");
+        }
     }
 
     #[test]
@@ -1235,7 +1154,7 @@ mod tests {
         assert_eq!(ast.len(), 1);
         if let MdAst::UnorderedList { items } = &ast[0] {
             assert_eq!(items.len(), 1);
-            assert!(items[0].contains("📝"));
+            assert!(item_text(&items[0]).contains("📝"));
         } else {
             panic!("Expected AST::UnorderedList");
         }
